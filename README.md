@@ -18,6 +18,12 @@ Just as a traditional operating system manages memory, storage, and process sche
 
 ---
 
+## The goal
+
+The goal of an agentic OS is simple: to provide the minimal sufficient evidence required to produce the highest quality decision and outcome.
+
+---
+
 ## Core principles
 
 1. **Context is working memory** — Models perform best with the smallest set of _relevant_ evidence. More context is not inherently better; irrelevant context degrades reasoning.
