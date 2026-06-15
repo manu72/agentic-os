@@ -1,28 +1,28 @@
 # Agentic OS
 
-Source of truth for t8 Agentic OS — the core agent skills and deterministic Python scripts used to bootstrap, route, and maintain agent context in software repositories.
+This is the source of truth for t8 Agentic OS. Agentic OS provides the core agent skills and deterministic Python scripts used to bootstrap, route, and maintain agent context in software repositories.
 
 This repo is intentionally minimal. There is no installer or package layout yet; skills and scripts are copied or linked into their runtime locations manually for now.
 
 ## What lives here
 
-| Path | Purpose |
-| --- | --- |
-| `skills/` | Canonical Agentic OS skills (`SKILL.md` per skill) |
-| `scripts/` | Standard-library Python tooling for graph sync, routing, memory validation, and updates |
-| `templates/` | Reserved for default `.agentic/` scaffold files (not populated yet) |
-| `tests/` | Reserved for script and routing tests (not populated yet) |
+| Path         | Purpose                                                                                 |
+| ------------ | --------------------------------------------------------------------------------------- |
+| `skills/`    | Canonical Agentic OS skills (`SKILL.md` per skill)                                      |
+| `scripts/`   | Standard-library Python tooling for graph sync, routing, memory validation, and updates |
+| `templates/` | Reserved for default `.agentic/` scaffold files (not populated yet)                     |
+| `tests/`     | Reserved for script and routing tests (not populated yet)                               |
 
 ## Skills
 
-| Skill | Role |
-| --- | --- |
+| Skill                 | Role                                                          |
+| --------------------- | ------------------------------------------------------------- |
 | `agenticOS-bootstrap` | Orchestrates first-time setup, repair, refresh, and migration |
-| `agenticOS-graph` | Installs and maintains the structural knowledge graph |
-| `agenticOS-memory` | Initialises and refreshes operational memory (`.agentic/`) |
-| `agenticOS-tooling` | Generates and repairs repo-local scripts and config |
-| `agenticOS-context` | Runtime context compilation for coding tasks |
-| `agenticOS-update` | Post-change memory and lesson maintenance |
+| `agenticOS-graph`     | Installs and maintains the structural knowledge graph         |
+| `agenticOS-memory`    | Initialises and refreshes operational memory (`.agentic/`)    |
+| `agenticOS-tooling`   | Generates and repairs repo-local scripts and config           |
+| `agenticOS-context`   | Runtime context compilation for coding tasks                  |
+| `agenticOS-update`    | Post-change memory and lesson maintenance                     |
 
 Skills are designed to be installed globally (for example under `~/.agents/skills/` or your editor's skill path), not committed into consumer repositories.
 
