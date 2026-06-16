@@ -16,8 +16,11 @@ if str(_SCRIPT_DIR) not in sys.path:
 from _common import (
     GRAPH_SYNC_TIMEOUT_SEC,
     extract_human_notes_region,
+    is_test_path,
     load_config,
     path_mentioned_in_region,
+    risk_tags,
+    subsystem_files,
 )
 
 MANAGED_START = "<!-- agentic:managed:start -->"
@@ -42,6 +45,7 @@ def run_graph_sync(root: Path) -> tuple[bool, str]:
             [sys.executable, str(script)],
             cwd=root,
             capture_output=True,
+            check=False,
             text=True,
             timeout=GRAPH_SYNC_TIMEOUT_SEC,
         )
@@ -82,44 +86,19 @@ def git_changed_files(root: Path, since_ref: str | None) -> list[str]:
         return []
 
 
-def infer_subsystems(changed: list[str], root: Path) -> list[str]:
-    sub_dir = root / ".agentic/SUBSYSTEMS"
-    hits: set[str] = set()
-    for path in changed:
-        parts = Path(path).parts
-        top = parts[0] if parts else ""
-        if top == "functions":
-            hits.add("functions")
-        elif top == "src" and len(parts) > 2 and parts[1] == "lib":
-            folder = parts[2]
-            lib_map = {
-                "offline": "offline",
-                "firebase": "firebase",
-                "data": "data",
-                "guest": "guest",
-                "camera": "guest",
-                "gallery": "guest",
-                "admin": "admin",
-                "invitations": "admin",
-            }
-            if folder in lib_map:
-                hits.add(lib_map[folder])
-        elif top == "src" and len(parts) > 2 and parts[1] == "routes":
-            route = parts[2]
-            if route == "admin":
-                hits.add("admin")
-            elif route == "e":
-                hits.add("guest")
-        elif top in {"firestore.rules", "storage.rules"}:
-            hits.update({"firebase", "data"})
-    for fp in sub_dir.glob("*.md"):
-        if fp.name == "README.md":
-            continue
-        text = fp.read_text(encoding="utf-8")
-        for path in changed:
-            if path in text:
-                hits.add(fp.stem)
-    return sorted(hits)
+def product_changed_files(changed: list[str], config: dict) -> list[str]:
+    """Drop test-only paths before mapping changed files to subsystem memory."""
+    return [path for path in changed if not is_test_path(path, config)]
+
+
+def affected_memory_files(changed: list[str], root: Path, config: dict) -> list[str]:
+    return subsystem_files(root, product_changed_files(changed, config))
+
+
+def infer_subsystems(changed: list[str], root: Path, config: dict | None = None) -> list[str]:
+    """Return subsystem stems for compatibility with older callers."""
+    cfg = config or {}
+    return [Path(path).stem for path in affected_memory_files(changed, root, cfg)]
 
 
 def replace_managed_block(content: str, new_inner: str) -> str:
@@ -186,7 +165,7 @@ def scan_stale_human_regions(root: Path, changed: list[str]) -> list[str]:
 
 def main() -> int:
     root = repo_root()
-    load_config(root)
+    config = load_config(root)
 
     graph_ok, graph_msg = run_graph_sync(root)
     if graph_ok:
@@ -198,11 +177,14 @@ def main() -> int:
     prev_ref = ref_path.read_text(encoding="utf-8").strip() if ref_path.is_file() else None
     head = git_head(root)
     changed = git_changed_files(root, prev_ref) if prev_ref else []
-    subsystems = infer_subsystems(changed, root)
+    change_detection = "commit-range" if prev_ref else "baseline"
+    product_changed = product_changed_files(changed, config)
+    affected_files = subsystem_files(root, product_changed)
+    risks = risk_tags(config, changed)
 
     refreshed: list[str] = []
     if refresh_memory_index(root, [".agentic/MEMORY_INDEX.md"]):
-        refreshed.append(".agentic/MEMORY_INDEX.md")
+        refreshed.append(".agentic/MEMORY_INDEX.md (metadata sync)")
 
     proposals = scan_stale_human_regions(root, changed)
     for proposal in proposals:
@@ -216,17 +198,30 @@ def main() -> int:
     print("=====================")
     print(f"graph status: {'ok' if graph_ok else graph_msg}")
     print(f"git HEAD: {head or 'unavailable'}")
+    print(f"change detection: {change_detection}")
+    print("update mode: metadata-only")
     print(f"changed since last run: {len(changed)} file(s)")
     if changed:
         for c in changed[:20]:
             print(f"  - {c}")
         if len(changed) > 20:
             print(f"  ... and {len(changed) - 20} more")
-    print(f"affected subsystems (inferred): {', '.join(subsystems) if subsystems else 'none'}")
+    print(f"product files mapped: {len(product_changed)} file(s)")
+    print(f"affected memory files: {', '.join(affected_files) if affected_files else 'none'}")
+    print(f"risk tags: {', '.join(risks) if risks else 'none'}")
     print(f"files refreshed: {', '.join(refreshed) if refreshed else 'none'}")
     print(f"human-region proposals awaiting confirmation: {len(proposals)}")
+    if proposals:
+        print("proposal note: consume these before rerunning; commit-range proposals are one-shot")
     print("proposed lesson entries: none (no durable evidence without user confirmation)")
-    print(f"unknowns: {'git unavailable' if not head else 'none'}")
+    unknowns: list[str] = []
+    if not head:
+        unknowns.append("git unavailable")
+    if not prev_ref:
+        unknowns.append("baseline established; no commit range scanned")
+    if not graph_ok:
+        unknowns.append(f"graph_sync: {graph_msg}")
+    print(f"unknowns: {', '.join(unknowns) if unknowns else 'none'}")
     return 0
 
 
