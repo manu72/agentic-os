@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 import subprocess
 import sys
@@ -26,6 +27,12 @@ from _common import (
 MANAGED_START = "<!-- agentic:managed:start -->"
 MANAGED_END = "<!-- agentic:managed:end -->"
 UPDATE_REF = ".agentic/CONTEXT/last_update_ref"
+
+
+@dataclass(frozen=True)
+class GitChangeSet:
+    paths: list[str]
+    error: str | None = None
 
 
 def repo_root() -> Path:
@@ -70,9 +77,25 @@ def git_head(root: Path) -> str | None:
         return None
 
 
-def git_changed_files(root: Path, since_ref: str | None) -> list[str]:
+def git_commit_time(root: Path, head: str | None) -> str | None:
+    if not head:
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "show", "-s", "--format=%cI", head],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return out.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def git_changed_files(root: Path, since_ref: str | None) -> GitChangeSet:
     if since_ref is None:
-        return []
+        return GitChangeSet([])
     try:
         out = subprocess.run(
             ["git", "diff", "--name-only", since_ref, "HEAD"],
@@ -81,9 +104,12 @@ def git_changed_files(root: Path, since_ref: str | None) -> list[str]:
             text=True,
             check=True,
         )
-        return [line.strip() for line in out.stdout.splitlines() if line.strip()]
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return []
+        return GitChangeSet([line.strip() for line in out.stdout.splitlines() if line.strip()])
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() if exc.stderr else str(exc)
+        return GitChangeSet([], f"git diff failed for {since_ref}: {detail}")
+    except FileNotFoundError:
+        return GitChangeSet([], "git unavailable")
 
 
 def product_changed_files(changed: list[str], config: dict) -> list[str]:
@@ -109,7 +135,65 @@ def replace_managed_block(content: str, new_inner: str) -> str:
     return before + MANAGED_START + new_inner + MANAGED_END + after
 
 
-def refresh_memory_index(root: Path, refreshed_files: list[str]) -> bool:
+def format_path_list(paths: list[str]) -> str:
+    return ", ".join(f"`{path}`" for path in paths) if paths else "none"
+
+
+def format_plain_list(items: list[str]) -> str:
+    return ", ".join(items) if items else "none"
+
+
+def upsert_evidence_refresh_section(inner: str, section: str) -> str:
+    pattern = r"\n## Evidence refresh\n.*?(?=\n## |\Z)"
+    replacement = "\n" + section.strip() + "\n"
+    if re.search(pattern, inner, flags=re.DOTALL):
+        return re.sub(pattern, replacement, inner, count=1, flags=re.DOTALL)
+    return inner.rstrip() + "\n\n" + section.strip() + "\n"
+
+
+def refresh_managed_memory_file(
+    root: Path,
+    rel_path: str,
+    *,
+    product_paths: list[str],
+    test_paths: list[str],
+    risks: list[str],
+    head: str | None,
+    refreshed_at: str | None,
+) -> bool:
+    path = root / rel_path
+    if not path.is_file():
+        return False
+    content = path.read_text(encoding="utf-8")
+    if MANAGED_START not in content or MANAGED_END not in content:
+        return False
+    if content.index(MANAGED_START) >= content.index(MANAGED_END):
+        return False
+
+    before, rest = content.split(MANAGED_START, 1)
+    inner, after_managed = rest.split(MANAGED_END, 1)
+    section = "\n".join(
+        [
+            "## Evidence refresh",
+            "",
+            f"- Commit: `{head or 'unknown'}`",
+            f"- Refreshed at: {refreshed_at or 'unknown'}",
+            f"- Product paths: {format_path_list(product_paths)}",
+            f"- Related test paths: {format_path_list(test_paths)}",
+            f"- Risk tags: {format_plain_list(risks)}",
+        ]
+    )
+    inner = upsert_evidence_refresh_section(inner, section)
+    path.write_text(before + MANAGED_START + inner + MANAGED_END + after_managed, encoding="utf-8")
+    return True
+
+
+def refresh_memory_index(
+    root: Path,
+    refreshed_files: list[str],
+    *,
+    refreshed_at: str | None = None,
+) -> bool:
     path = root / ".agentic/MEMORY_INDEX.md"
     if not path.is_file():
         return False
@@ -118,7 +202,7 @@ def refresh_memory_index(root: Path, refreshed_files: list[str]) -> bool:
         return False
     if content.index(MANAGED_START) >= content.index(MANAGED_END):
         return False
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    now = refreshed_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     managed, rest = content.split(MANAGED_START, 1)
     inner, after_managed = rest.split(MANAGED_END, 1)
     inner = re.sub(
@@ -176,21 +260,44 @@ def main() -> int:
     ref_path = root / UPDATE_REF
     prev_ref = ref_path.read_text(encoding="utf-8").strip() if ref_path.is_file() else None
     head = git_head(root)
-    changed = git_changed_files(root, prev_ref) if prev_ref else []
+    change_set = git_changed_files(root, prev_ref) if prev_ref else GitChangeSet([])
+    changed = change_set.paths
     change_detection = "commit-range" if prev_ref else "baseline"
     product_changed = product_changed_files(changed, config)
     affected_files = subsystem_files(root, product_changed)
     risks = risk_tags(config, changed)
+    changed_tests = [path for path in changed if is_test_path(path, config)]
+    refreshed_at = git_commit_time(root, head)
 
     refreshed: list[str] = []
-    if refresh_memory_index(root, [".agentic/MEMORY_INDEX.md"]):
-        refreshed.append(".agentic/MEMORY_INDEX.md (metadata sync)")
+    if change_set.error is None:
+        for memory_file in affected_files:
+            paths_for_file = [
+                path for path in product_changed if memory_file in subsystem_files(root, [path])
+            ]
+            risks_for_file = risk_tags(config, paths_for_file + changed_tests)
+            if refresh_managed_memory_file(
+                root,
+                memory_file,
+                product_paths=paths_for_file,
+                test_paths=changed_tests,
+                risks=risks_for_file,
+                head=head,
+                refreshed_at=refreshed_at,
+            ):
+                refreshed.append(memory_file)
+        if refreshed and refresh_memory_index(
+            root,
+            [*refreshed, ".agentic/MEMORY_INDEX.md"],
+            refreshed_at=refreshed_at,
+        ):
+            refreshed.append(".agentic/MEMORY_INDEX.md")
 
     proposals = scan_stale_human_regions(root, changed)
     for proposal in proposals:
         print(f"proposal (needs confirmation): {proposal}")
 
-    if head:
+    if head and change_set.error is None:
         ref_path.parent.mkdir(parents=True, exist_ok=True)
         ref_path.write_text(head + "\n", encoding="utf-8")
 
@@ -199,7 +306,7 @@ def main() -> int:
     print(f"graph status: {'ok' if graph_ok else graph_msg}")
     print(f"git HEAD: {head or 'unavailable'}")
     print(f"change detection: {change_detection}")
-    print("update mode: metadata-only")
+    print(f"update mode: {'managed refresh' if affected_files else 'memory index refresh'}")
     print(f"changed since last run: {len(changed)} file(s)")
     if changed:
         for c in changed[:20]:
@@ -215,6 +322,8 @@ def main() -> int:
         print("proposal note: consume these before rerunning; commit-range proposals are one-shot")
     print("proposed lesson entries: none (no durable evidence without user confirmation)")
     unknowns: list[str] = []
+    if change_set.error:
+        unknowns.append(change_set.error)
     if not head:
         unknowns.append("git unavailable")
     if not prev_ref:
@@ -222,7 +331,7 @@ def main() -> int:
     if not graph_ok:
         unknowns.append(f"graph_sync: {graph_msg}")
     print(f"unknowns: {', '.join(unknowns) if unknowns else 'none'}")
-    return 0
+    return 1 if change_set.error else 0
 
 
 if __name__ == "__main__":
