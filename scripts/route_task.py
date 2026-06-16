@@ -22,6 +22,22 @@ from _common import (
 )
 
 MAX_PATHS = 10
+MAX_DEPENDENCY_PATHS = 5
+MAX_TEST_PATHS = 5
+CODE_EXTENSIONS = (
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".py",
+    ".md",
+    ".mjs",
+    ".cjs",
+    ".css",
+    ".glsl",
+    ".svelte",
+)
+RISK_STOP_TAGS = {"security", "money", "data-integrity", "secrets", "infra"}
 STOPWORDS = {
     "a", "an", "the", "and", "or", "for", "to", "in", "on", "at", "of", "with",
     "fix", "add", "update", "change", "implement", "refactor", "debug", "test",
@@ -29,10 +45,11 @@ STOPWORDS = {
 }
 
 PATH_CANDIDATE = re.compile(
-    r"(?:`)?((?:[\w@.-]+/)+[\w@./-]+\.(?:json|tsx?|jsx?|py|md|mjs|cjs|css|glsl|ts))(?:`)?",
+    r"(?:`)?((?:[\w@.+-]+/)+[\w@.+/-]+\.(?:json|tsx?|jsx?|py|md|mjs|cjs|css|glsl|svelte))(?:`)?",
     re.IGNORECASE,
 )
 SYMBOL_CANDIDATE = re.compile(r"\b([A-Z][A-Za-z0-9_]+)\b")
+BACKTICK_PATH = re.compile(r"`([^`\n]+)`")
 
 
 def repo_root() -> Path:
@@ -43,31 +60,53 @@ def repo_root() -> Path:
     return root
 
 
-def load_graph(root: Path, config: dict) -> tuple[dict | None, bool, str, bool]:
+def load_graph(root: Path, config: dict) -> tuple[dict | None, bool, str, bool, str, list[str]]:
     graph_path = graph_path_from_config(root, config)
-    fallback_active = False
     rel = graph_rel_path_str(root, config, graph_path)
+    errors: list[str] = []
     if graph_path.is_file():
         try:
             with graph_path.open(encoding="utf-8") as fh:
-                return json.load(fh), True, rel, False
-        except json.JSONDecodeError:
-            pass
+                return json.load(fh), True, rel, False, "graph-first", []
+        except json.JSONDecodeError as exc:
+            errors.append(f"graph JSON is invalid: {rel} ({exc.msg})")
+    else:
+        errors.append(f"graph file missing: {rel}")
+
+    graph_config = config.get("graph", {})
+    graph_required = not isinstance(graph_config, dict) or graph_config.get("required", True)
+    if graph_required:
+        return None, False, rel, False, "broken", errors
+
     codemap = root / ".agentic/CODEMAP.json"
     if codemap.is_file():
         try:
             with codemap.open(encoding="utf-8") as fh:
-                return json.load(fh), False, ".agentic/CODEMAP.json", True
-        except json.JSONDecodeError:
-            pass
-    return None, False, rel, False
+                return json.load(fh), False, ".agentic/CODEMAP.json", True, "fallback", errors
+        except json.JSONDecodeError as exc:
+            errors.append(f"CODEMAP JSON is invalid: .agentic/CODEMAP.json ({exc.msg})")
+    else:
+        errors.append("CODEMAP fallback missing: .agentic/CODEMAP.json")
+    return None, False, rel, False, "broken", errors
+
+
+def candidate_path_strings(task: str) -> list[str]:
+    candidates: list[str] = []
+    for match in PATH_CANDIDATE.finditer(task):
+        candidate = match.group(1)
+        if candidate not in candidates:
+            candidates.append(candidate)
+    for match in BACKTICK_PATH.finditer(task):
+        raw = match.group(1).strip()
+        if ("/" in raw or "." in raw) and raw not in candidates:
+            candidates.append(raw)
+    return candidates
 
 
 def extract_explicit_paths(task: str, root: Path) -> list[str]:
     found: list[str] = []
     root_resolved = root.resolve()
-    for match in PATH_CANDIDATE.finditer(task):
-        candidate = match.group(1)
+    for candidate in candidate_path_strings(task):
         resolved = resolve_repo_file(root, candidate)
         if resolved is None:
             continue
@@ -89,6 +128,17 @@ def task_terms(task: str) -> list[str]:
             if len(part) >= 3 and part not in STOPWORDS and part not in terms:
                 terms.append(part)
     return terms
+
+
+def task_symbols(task: str) -> list[str]:
+    """Extract likely code symbols without treating short acronyms as anchors."""
+    symbols: list[str] = []
+    for match in SYMBOL_CANDIDATE.findall(task):
+        if len(match) <= 2 and match.isupper():
+            continue
+        if match not in symbols:
+            symbols.append(match)
+    return symbols
 
 
 def index_graph(graph: dict) -> tuple[dict[str, dict], dict[str, list[str]], dict[str, str]]:
@@ -200,6 +250,8 @@ def discover_tests(root: Path, config: dict, paths: list[str]) -> list[str]:
                 for item in base.rglob("*"):
                     if not item.is_file():
                         continue
+                    if "__pycache__" in item.parts or item.suffix.lower() not in CODE_EXTENSIONS:
+                        continue
                     rel = str(item.relative_to(root))
                     name_lower = item.name.lower()
                     if stem.lower() in name_lower or parent.lower() in name_lower:
@@ -210,9 +262,6 @@ def discover_tests(root: Path, config: dict, paths: list[str]) -> list[str]:
             if matched and rel not in tests:
                 tests.append(rel)
     return tests[:5]
-
-
-BACKTICK_PATH = re.compile(r"`([^`\n]+)`")
 
 
 def owned_paths_from_subsystem(text: str) -> list[str]:
@@ -326,17 +375,44 @@ def _glob_parts(pattern_parts: list[str], path_parts: list[str]) -> bool:
     return _glob_parts(tail, path_parts[1:])
 
 
-def filesystem_fallback(root: Path, terms: list[str], limit: int) -> list[tuple[str, str]]:
+def ignored_by_config(path: str, config: dict) -> bool:
+    default_ignore_parts = {
+        "node_modules",
+        ".git",
+        ".next",
+        "dist",
+        "build",
+        ".venv",
+        "coverage",
+        "__pycache__",
+    }
+    norm = path.replace("\\", "/")
+    if any(part in default_ignore_parts for part in Path(norm).parts):
+        return True
+    for pattern in config.get("ignore_globs", []):
+        if not isinstance(pattern, str):
+            continue
+        if glob_match(pattern, norm) or glob_match(pattern, norm + "/"):
+            return True
+    return False
+
+
+def filesystem_fallback(root: Path, config: dict, terms: list[str], limit: int) -> list[tuple[str, str]]:
     results: list[tuple[str, str]] = []
-    ignore_parts = {"node_modules", ".git", ".next", "dist", "build", ".venv", "coverage"}
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in ignore_parts]
+        kept_dirs: list[str] = []
+        for dirname in dirnames:
+            rel_dir = str(Path(dirpath, dirname).relative_to(root))
+            if not ignored_by_config(rel_dir, config):
+                kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
         for name in filenames:
-            if not name.endswith((".ts", ".tsx", ".js", ".jsx", ".py", ".md")):
+            path = Path(dirpath, name)
+            rel = str(path.relative_to(root))
+            if path.suffix.lower() not in CODE_EXTENSIONS or ignored_by_config(rel, config):
                 continue
             lower = name.lower()
             if any(t in lower for t in terms):
-                rel = str(Path(dirpath, name).relative_to(root))
                 results.append((rel, "filesystem fallback"))
                 if len(results) >= limit:
                     return results
@@ -351,6 +427,8 @@ def build_bundle(
     graph_available: bool,
     graph_source: str,
     fallback_active: bool,
+    graph_status: str,
+    graph_errors: list[str],
     explain: bool,
 ) -> dict:
     selected: list[str] = []
@@ -358,18 +436,24 @@ def build_bundle(
     graph_nodes: list[str] = []
     unknowns: list[str] = []
     stop_conditions: list[str] = []
+    explicit_graph_matches = 0
 
-    def add_path(path: str, reason: str) -> None:
+    def add_path(path: str, reason: str) -> bool:
         if path not in selected and len(selected) < MAX_PATHS:
             selected.append(path)
             reasons[path] = reason
+            return True
+        return path in selected
 
     explicit = extract_explicit_paths(task, root)
     for p in explicit:
         add_path(p, "user-named")
 
     terms = task_terms(task)
-    if graph and (graph_available or fallback_active):
+    if graph_status == "broken":
+        unknowns.extend(graph_errors)
+        stop_conditions.append("required graph unavailable — run agenticOS-graph")
+    elif graph and (graph_available or fallback_active):
         search_reason = "graph search" if graph_available else "codemap search"
         anchor_reason = "graph anchor" if graph_available else "codemap anchor"
         by_id, adjacency, file_by_path = index_graph(graph)
@@ -377,15 +461,20 @@ def build_bundle(
             for p in explicit:
                 nid = file_by_path.get(p)
                 if nid:
+                    explicit_graph_matches += 1
                     graph_nodes.append(nid)
-            for p, reason in expand_dependencies(explicit, by_id, adjacency, file_by_path, MAX_PATHS):
+            for p, reason in expand_dependencies(
+                explicit, by_id, adjacency, file_by_path, MAX_DEPENDENCY_PATHS
+            ):
                 add_path(p, reason)
-        for p, _reason, _score in graph_search(graph, terms, MAX_PATHS):
-            add_path(p, search_reason)
-            nid = file_by_path.get(p)
-            if nid and nid not in graph_nodes:
-                graph_nodes.append(nid)
-        for sym in SYMBOL_CANDIDATE.findall(task):
+        if not explicit:
+            search_limit = max(0, MAX_PATHS - len(selected))
+            for p, _reason, _score in graph_search(graph, terms, search_limit):
+                add_path(p, search_reason)
+                nid = file_by_path.get(p)
+                if nid and nid not in graph_nodes:
+                    graph_nodes.append(nid)
+        for sym in task_symbols(task):
             for node in graph.get("nodes", []):
                 if node.get("name") == sym or sym in str(node.get("id", "")):
                     fp = node_to_path(node)
@@ -397,23 +486,21 @@ def build_bundle(
     elif not graph_available and not fallback_active:
         unknowns.append("graph unavailable and no CODEMAP fallback")
 
-    if not selected and terms:
-        for p, reason in filesystem_fallback(root, terms, MAX_PATHS):
+    if graph_status != "broken" and not selected and terms:
+        for p, reason in filesystem_fallback(root, config, terms, MAX_PATHS):
             add_path(p, reason)
 
-    related_tests = discover_tests(root, config, selected)
-    for t in related_tests:
-        add_path(t, f"test for {selected[0]}" if selected else "test discovery")
-
     product_paths = [p for p in selected if not is_test_path(p, config)]
+    related_tests = discover_tests(root, config, product_paths)[:MAX_TEST_PATHS]
     subsystem_files_list = subsystem_files(root, product_paths)
     memory_files_list = memory_files(root)
     dependency_paths = [p for p, r in reasons.items() if r == "dependency"]
-    risk = risk_tags(config, selected)
+    risk = risk_tags(config, selected + related_tests)
 
     has_anchors = bool(explicit)
-    has_tests = bool(related_tests)
-    if has_anchors and graph_available and has_tests:
+    if graph_status == "broken":
+        confidence = "low"
+    elif has_anchors and graph_available and explicit_graph_matches:
         confidence = "high"
     elif selected and (graph_available or explicit):
         confidence = "medium"
@@ -424,15 +511,21 @@ def build_bundle(
     if fallback_active:
         if confidence == "high":
             confidence = "medium"
-        elif confidence == "medium":
-            confidence = "low"
+
+    blocking_risks = [tag for tag in risk if tag in RISK_STOP_TAGS]
+    if blocking_risks and confidence != "high":
+        joined = ", ".join(blocking_risks)
+        stop_conditions.append(f"risk tags require high confidence: {joined}")
 
     bundle = {
         "task": task,
         "confidence": confidence,
+        "graph_status": graph_status,
         "graph_available": graph_available,
         "graph_source": graph_source,
         "fallback_active": fallback_active,
+        "graph_errors": graph_errors,
+        "explicit_paths": explicit,
         "selected_paths": selected,
         "selection_reasons": reasons,
         "graph_nodes": graph_nodes[:15],
@@ -464,10 +557,21 @@ def main() -> int:
     task = " ".join(args)
     root = repo_root()
     config = load_config(root)
-    graph, graph_available, graph_source, fallback_active = load_graph(root, config)
+    graph, graph_available, graph_source, fallback_active, graph_status, graph_errors = load_graph(
+        root, config
+    )
 
     bundle = build_bundle(
-        task, root, config, graph, graph_available, graph_source, fallback_active, explain
+        task,
+        root,
+        config,
+        graph,
+        graph_available,
+        graph_source,
+        fallback_active,
+        graph_status,
+        graph_errors,
+        explain,
     )
 
     cache_rel = config.get("paths", {}).get("context_cache", ".agentic/CONTEXT/last_context.json")
